@@ -2,14 +2,20 @@
 import os
 import time
 import math
+import json
 import traceback
+from datetime import datetime
 from typing import Optional, Dict, Any, List
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import numpy as np
 import tushare as ts
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from threading import RLock
+
+import seelect5_enhanced
 
 # =========================
 # Config
@@ -21,6 +27,7 @@ CACHE_DIR = os.getenv("TS_CACHE_DIR", "./cache_ts")
 BASIC_PARQUET = os.path.join(CACHE_DIR, "stock_basic.parquet")
 UNIVERSE_PARQUET = os.path.join(CACHE_DIR, "universe_latest.parquet")
 UNIVERSE_META_JSON = os.path.join(CACHE_DIR, "universe_meta.json")
+SELECT_RESULT_JSON = os.path.join(CACHE_DIR, "selector_result_latest.json")
 
 DAILY_DIR = os.path.join(CACHE_DIR, "daily")  # raw daily parquet per ts_code
 ADJ_DIR = os.path.join(CACHE_DIR, "adj")      # adj_factor parquet per ts_code
@@ -197,6 +204,141 @@ def _ensure_stock_basic(force: bool = False) -> pd.DataFrame:
 # =========================
 app = FastAPI(title=APP_TITLE)
 
+
+def _today_shanghai() -> str:
+    return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+
+
+@app.get("/", response_class=HTMLResponse)
+def home_page():
+    return """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tushare Universe + 选股看板</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 24px; }
+    button { border: none; border-radius: 8px; padding: 10px 14px; cursor: pointer; margin-right: 8px; }
+    .primary { background: #2563eb; color: white; }
+    .secondary { background: #f3f4f6; }
+    .success { background: #059669; color: white; }
+    #status { margin: 10px 0; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+    th, td { border-bottom: 1px solid #e5e7eb; padding: 8px; text-align: right; }
+    th:first-child, td:first-child, th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3) { text-align: left; }
+    .meta { color: #6b7280; font-size: 13px; }
+    h3 { margin-top: 30px; }
+  </style>
+</head>
+<body>
+  <h2>Tushare Universe + 选股看板</h2>
+  <div>
+    <button id="refreshBtn" class="primary">刷新今日Universe</button>
+    <button id="reloadBtn" class="secondary">仅重新加载Universe</button>
+    <button id="runSelectorBtn" class="success">运行选股脚本</button>
+    <button id="reloadSelectorBtn" class="secondary">读取最近选股结果</button>
+  </div>
+  <p id="status">准备就绪</p>
+  <p class="meta" id="meta"></p>
+
+  <h3>Universe（前200）</h3>
+  <table>
+    <thead><tr><th>代码</th><th>名称</th><th>行业</th><th>价格</th><th>涨跌(%)</th><th>成交额(元)</th><th>换手率</th><th>市盈率TTM</th><th>市净率</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <h3>选股结果（Top30）</h3>
+  <p class="meta" id="selectorMeta"></p>
+  <table>
+    <thead><tr><th>代码</th><th>名称</th><th>模型</th><th>现价</th><th>涨跌(%)</th><th>成交额(元)</th><th>融合分</th><th>模型分</th><th>Rank分</th></tr></thead>
+    <tbody id="selectorRows"></tbody>
+  </table>
+
+<script>
+const statusEl = document.getElementById('status');
+const rowsEl = document.getElementById('rows');
+const metaEl = document.getElementById('meta');
+const selectorRowsEl = document.getElementById('selectorRows');
+const selectorMetaEl = document.getElementById('selectorMeta');
+
+function fmt(v, digits = 2) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toFixed(digits) : '-';
+}
+function setStatus(msg, isError=false) {
+  statusEl.textContent = msg;
+  statusEl.style.color = isError ? '#dc2626' : '#111827';
+}
+
+async function loadUniverse(limit = 200) {
+  try {
+    const r = await fetch(`/universe?limit=${limit}`);
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    rowsEl.innerHTML = data.head.map((x) => `<tr><td>${x.code ?? ''}</td><td>${x.name ?? ''}</td><td>${x.industry ?? ''}</td><td>${fmt(x.price,2)}</td><td>${fmt(x.pct,2)}</td><td>${fmt(x.amount_yuan,0)}</td><td>${fmt(x.turnover_rate,2)}</td><td>${fmt(x.pe_ttm,2)}</td><td>${fmt(x.pb,2)}</td></tr>`).join('');
+    metaEl.textContent = `trade_date=${data.meta?.trade_date ?? '-'} ｜ rows=${data.rows ?? 0} ｜ updated_at=${data.meta?.updated_at ?? '-'}`;
+  } catch (e) {
+    rowsEl.innerHTML = '';
+    setStatus(`Universe加载失败：${e.message}`, true);
+  }
+}
+
+async function loadSelectorResult() {
+  try {
+    const r = await fetch('/selector_result');
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    const rows = data.rows || [];
+    selectorRowsEl.innerHTML = rows.map((x) => `<tr><td>${x.code ?? ''}</td><td>${x.name ?? ''}</td><td>${x.model ?? ''}</td><td>${fmt(x.price,2)}</td><td>${fmt(x.pct,2)}</td><td>${fmt(x.amount_yuan,0)}</td><td>${fmt(x.score_fused,4)}</td><td>${fmt(x.score,4)}</td><td>${fmt(x.rank_score,4)}</td></tr>`).join('');
+    selectorMetaEl.textContent = `generated_at=${data.generated_at ?? '-'} ｜ regime=${data.regime ?? '-'} ｜ total_candidates=${data.total_candidates ?? 0} ｜ topk=${data.topk ?? rows.length}`;
+    return rows.length;
+  } catch (e) {
+    selectorRowsEl.innerHTML = '';
+    selectorMetaEl.textContent = `暂无选股结果：${e.message}`;
+    return 0;
+  }
+}
+
+async function refreshToday() {
+  setStatus('正在刷新今日Universe...');
+  try {
+    const r = await fetch('/refresh_today?with_basic=1', { method: 'POST' });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    setStatus(`刷新成功：trade_date=${data.universe_meta?.trade_date}，rows=${data.rows}`);
+    await loadUniverse();
+  } catch (e) {
+    setStatus(`刷新失败：${e.message}`, true);
+  }
+}
+
+async function runSelector() {
+  setStatus('正在运行选股脚本，请稍候（可能需要几十秒）...');
+  try {
+    const r = await fetch('/run_selector?topk=30', { method: 'POST' });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    setStatus(`选股完成：总候选=${data.total_candidates}，Top=${data.topk}`);
+    await loadSelectorResult();
+  } catch (e) {
+    setStatus(`选股失败：${e.message}`, true);
+  }
+}
+
+document.getElementById('refreshBtn').addEventListener('click', refreshToday);
+document.getElementById('reloadBtn').addEventListener('click', () => loadUniverse());
+document.getElementById('runSelectorBtn').addEventListener('click', runSelector);
+document.getElementById('reloadSelectorBtn').addEventListener('click', loadSelectorResult);
+
+loadUniverse();
+loadSelectorResult();
+</script>
+</body>
+</html>
+"""
+
 @app.get("/health")
 def health():
     meta = _load_universe_meta()
@@ -324,6 +466,11 @@ def refresh_universe(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"refresh_universe failed: {e}")
 
+
+@app.post("/refresh_today")
+def refresh_today(with_basic: int = Query(1, description="same as /refresh_universe with_basic")):
+    return refresh_universe(trade_date=_today_shanghai(), with_basic=with_basic)
+
 @app.get("/universe")
 def universe(limit: int = 200):
     if not os.path.exists(UNIVERSE_PARQUET):
@@ -335,6 +482,34 @@ def universe(limit: int = 200):
         "head": df.head(int(limit)).to_dict(orient="records"),
         "meta": _load_universe_meta(),
     }
+
+
+
+@app.post("/run_selector")
+def run_selector(topk: int = Query(30, ge=1, le=100)):
+    _ensure_dir()
+    try:
+        result = seelect5_enhanced.run_selector(topk_out=topk, make_charts=False)
+        if not isinstance(result, dict):
+            raise RuntimeError("selector returned empty result")
+        with open(SELECT_RESULT_JSON, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        return {"ok": True, **result}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"run_selector failed: {e}")
+
+
+@app.get("/selector_result")
+def selector_result():
+    if not os.path.exists(SELECT_RESULT_JSON):
+        raise HTTPException(status_code=404, detail="selector result not found. call /run_selector first.")
+    try:
+        with open(SELECT_RESULT_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {"ok": True, **data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"load selector_result failed: {e}")
 
 @app.post("/daily_refresh/{code}")
 def daily_refresh(code: str, start_date: str = "20180101", end_date: str = ""):

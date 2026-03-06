@@ -674,7 +674,7 @@ def save_charts(res: pd.DataFrame, out_dir: str = "./out_charts"):
 # =========================
 # Main
 # =========================
-def main():
+def run_selector(topk_out=TOPK_OUT, make_charts=False):
     # 1) load universe
     spot = load_universe_df()
 
@@ -990,14 +990,30 @@ def main():
     for c in show_cols:
         if c not in res.columns:
             res[c] = np.nan
-    print(res.head(TOPK_OUT)[show_cols].to_string(index=False))
+    top_df = res.head(int(topk_out)).copy()
+    print(top_df[show_cols].to_string(index=False))
 
     best = res.iloc[0].to_dict()
     print("\n✅ 我给你的“选一个”（最终融合评分最佳）")
     print(best)
 
     # charts
-    save_charts(res)
+    if make_charts:
+        save_charts(res)
+
+    return {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "regime": regime,
+        "total_candidates": int(len(res)),
+        "topk": int(len(top_df)),
+        "best": best,
+        "rows": top_df.to_dict(orient="records"),
+    }
+
+
+def main():
+    run_selector(topk_out=TOPK_OUT, make_charts=True)
+
 
 if __name__ == "__main__":
     main()
